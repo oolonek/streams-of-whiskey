@@ -1,0 +1,22 @@
+[package]
+name = "streams-of-whiskey"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+arrow-array = "60"
+arrow-schema = "60"
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+console = "0.16"
+csv = "1"
+httpdate = "1"
+indicatif = "0.18"
+parquet = { version = "60", features = ["arrow"] }
+rand = "0.9"
+rayon = "1"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+smiles-rs = "0.2.1"
