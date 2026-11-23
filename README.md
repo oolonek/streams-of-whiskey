@@ -20,17 +20,18 @@ Without `--max-datasets`, discovery pages through the entire Hub listing until i
 ## Snapshot at a glance
 
 <!-- cache-timings:start -->
-Local cache report generated 2026-11-23 09:53:13 UTC; the published dashboard may differ. These are **observed completion spans, not runtimes or forecasts**.
+Local cache report generated 2026-11-23 22:11:23 UTC; the published dashboard may differ. These are **observed completion spans, not runtimes or forecasts**.
 
 | Metric | Observed value | Scope |
 | --- | ---: | --- |
-| Inspected datasets | 422 | 422 complete; 0 partial |
-| Valid parsed cells | 408,167,204 | Exact sum across inspected files |
-| Estimated unique valid strings | ≈331,833,141 | HyperLogLog across inspected files |
-| Cached discovery probes | 9,316 | 422 `found`; metadata-only skips are not cached |
-| Discovery completion window | 2h 35m 06s | 2026-11-20 20:38:01–2026-11-20 23:13:07 UTC |
+| Inspected datasets | 431 | 431 complete; 0 partial |
+| Valid parsed cells | 430,125,764 | Exact sum across inspected files |
+| Estimated unique valid strings | ≈340,771,196 | HyperLogLog across inspected files |
+| Cached discovery probes | 9,526 | 522 `found`; metadata-only skips are not cached |
+| Discovery completion window | 72h 41m 06s | 2026-11-20 20:44:10–2026-11-23 21:25:16 UTC |
 | Inspections on 2026-11-20 | 20s | 20 files; 2026-11-20 20:40:29–2026-11-20 20:40:49 UTC |
-| Inspections on 2026-11-22 | 35m 59s | 402 files; 2026-11-22 18:58:42–2026-11-22 19:34:41 UTC |
+| Inspections on 2026-11-22 | 35m 59s | 400 files; 2026-11-22 18:58:42–2026-11-22 19:34:41 UTC |
+| Inspections on 2026-11-23 | 8h 49m 45s | 11 files; 2026-11-23 12:59:14–2026-11-23 21:48:59 UTC |
 <!-- cache-timings:end -->
 
 These are spans between the first and last **saved completions**, not measured runtimes or time required for a future run. The cache replaces earlier results and records neither crawl starts nor individual scan durations. Running this command exports the current cache figures as JSON **and refreshes the marked date and table above in `README.md`** (from the repository root; overwrites the JSON output). Re-export the dashboard separately to publish new inspection data:
