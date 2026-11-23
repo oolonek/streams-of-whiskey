@@ -1,0 +1,15 @@
+# Fast discovery checks dataset IDs, Hub tags, and descriptions for any of these
+# case-insensitive ASCII substrings. Edit this array to tune the metadata screen.
+# This does not change file formats, access rules, or SMILES content validation.
+hints = [
+  "smiles",
+  "chem",
+  "molecul",
+  "compound",
+  "drug",
+  "ligand",
+  "pubchem",
+  "zinc",
+  "tox21",
+  "qm9",
+]

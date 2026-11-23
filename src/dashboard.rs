@@ -36,11 +36,12 @@ struct Snapshot {
     datasets: Vec<Dataset>,
 }
 
-/// Export only the display fields; the crawl cache and the strings themselves stay local.
-pub fn export(cache_path: &Path, output: &Path) -> Result<(), Box<dyn Error>> {
-    let mut connection = Connection::open_with_flags(cache_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    let transaction = connection.transaction()?;
-    let legacy: bool = transaction.query_row(
+/// Share the sketch validation and merge with other cache-derived reports.
+pub(crate) fn estimated_unique(
+    connection: &Connection,
+    dataset_count: u64,
+) -> Result<u64, Box<dyn Error>> {
+    let legacy: bool = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'inspected_smiles')",
         [],
         |row| row.get(0),
@@ -48,7 +49,7 @@ pub fn export(cache_path: &Path, output: &Path) -> Result<(), Box<dyn Error>> {
     if legacy {
         return Err("legacy exact-SMILES storage detected; stop inspections and run --migrate-hll before exporting".into());
     }
-    let format: String = transaction.query_row(
+    let format: String = connection.query_row(
         "SELECT value FROM cache_metadata WHERE key = 'sketch_format'",
         [],
         |row| row.get(0),
@@ -56,24 +57,10 @@ pub fn export(cache_path: &Path, output: &Path) -> Result<(), Box<dyn Error>> {
     if format != FORMAT {
         return Err(format!("unsupported sketch format {format:?}; expected {FORMAT}").into());
     }
-    let datasets = {
-        let mut statement = transaction
-            .prepare("SELECT detail_json FROM inspection_results ORDER BY dataset_id")?;
-        statement
-            .query_map([], |row| row.get::<_, String>(0))?
-            .map(|result| -> Result<Dataset, Box<dyn Error>> {
-                let dataset: Dataset = serde_json::from_str(&result?)?;
-                if !matches!(dataset.status.as_str(), "complete" | "partial") {
-                    return Err(format!("non-completed inspection: {}", dataset.dataset).into());
-                }
-                Ok(dataset)
-            })
-            .collect::<Result<Vec<_>, _>>()?
-    };
     let mut merged = Sketch::new();
-    let mut read_sketches = 0_usize;
+    let mut read_sketches = 0_u64;
     {
-        let mut statement = transaction.prepare(
+        let mut statement = connection.prepare(
             "SELECT r.dataset_id, s.registers
              FROM inspection_results r LEFT JOIN inspection_sketches s USING (dataset_id)
              ORDER BY r.dataset_id",
@@ -92,16 +79,38 @@ pub fn export(cache_path: &Path, output: &Path) -> Result<(), Box<dyn Error>> {
         }
     }
     let sketch_count: u64 =
-        transaction.query_row("SELECT COUNT(*) FROM inspection_sketches", [], |row| {
+        connection.query_row("SELECT COUNT(*) FROM inspection_sketches", [], |row| {
             row.get(0)
         })?;
-    if read_sketches != datasets.len() || sketch_count != datasets.len() as u64 {
+    if read_sketches != dataset_count || sketch_count != dataset_count {
         return Err("inspection sketches do not match saved inspections; run --migrate-hll".into());
     }
+    Ok(merged.estimate())
+}
+
+/// Export only the display fields; the crawl cache and the strings themselves stay local.
+pub fn export(cache_path: &Path, output: &Path) -> Result<(), Box<dyn Error>> {
+    let mut connection = Connection::open_with_flags(cache_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let transaction = connection.transaction()?;
+    let datasets = {
+        let mut statement = transaction
+            .prepare("SELECT detail_json FROM inspection_results ORDER BY dataset_id")?;
+        statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .map(|result| -> Result<Dataset, Box<dyn Error>> {
+                let dataset: Dataset = serde_json::from_str(&result?)?;
+                if !matches!(dataset.status.as_str(), "complete" | "partial") {
+                    return Err(format!("non-completed inspection: {}", dataset.dataset).into());
+                }
+                Ok(dataset)
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let estimated_unique_valid_smiles = estimated_unique(&transaction, datasets.len() as u64)?;
     transaction.commit()?;
     let snapshot = Snapshot {
         generated_at_unix: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
-        estimated_unique_valid_smiles: merged.estimate(),
+        estimated_unique_valid_smiles,
         datasets,
     };
     // Serialize before replacing a previously published snapshot.

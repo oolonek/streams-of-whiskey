@@ -9,10 +9,11 @@ mod parquet_probe;
 mod rate;
 mod smiles_evidence;
 mod text_probe;
+mod timings;
 use streams_of_whiskey::hll;
 
 use std::io::{self, IsTerminal, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
@@ -35,7 +36,7 @@ const PAGE_SIZE: u64 = 200;
 const MAX_RESPONSE_BYTES: u64 = 2 * 1024 * 1024;
 
 #[derive(Parser)]
-#[command(about = "Screen chemistry-tagged Hugging Face CSV/TSV files for parseable SMILES")]
+#[command(about = "Screen Hugging Face datasets for parseable SMILES")]
 struct Args {
     /// Optional dataset IDs; omit to crawl the public Hub dataset listing
     datasets: Vec<String>,
@@ -60,6 +61,9 @@ struct Args {
     /// Skip the chemistry keyword check, but keep fast CSV/TSV and access filters
     #[arg(long, conflicts_with = "thorough")]
     no_chemistry_filter: bool,
+    /// TOML file of metadata hint substrings for fast listing scans
+    #[arg(long, default_value = "chemistry-hints.toml", value_name = "PATH")]
+    chemistry_hints_file: PathBuf,
     /// Emit machine-readable JSON lines instead of human-friendly progress and color
     #[arg(long)]
     json: bool,
@@ -84,6 +88,9 @@ struct Args {
     /// Export the stored inspections as a static dashboard JSON snapshot
     #[arg(long, value_name = "PATH", conflicts_with_all = ["datasets", "inspect_found", "max_datasets", "search", "json", "thorough", "no_chemistry_filter", "refresh"])]
     export_dashboard: Option<PathBuf>,
+    /// Export cache metrics as JSON and refresh the README headline table
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["datasets", "inspect_found", "export_dashboard", "migrate_hll", "compact_cache", "max_datasets", "search", "json", "thorough", "no_chemistry_filter", "refresh"])]
+    export_timings: Option<PathBuf>,
     /// Convert legacy exact SMILES records to sketches, then compact SQLite (stop active inspections first)
     #[arg(long, conflicts_with_all = ["datasets", "inspect_found", "export_dashboard", "compact_cache", "max_datasets", "search", "json", "thorough", "no_chemistry_filter", "refresh"])]
     migrate_hll: bool,
@@ -448,24 +455,35 @@ fn tabular_format(path: &str) -> Option<&'static str> {
         .find(|format| suffix.eq_ignore_ascii_case(format))
 }
 
-const CHEMISTRY_HINTS: &[&[u8]] = &[
-    b"smiles",
-    b"chem",
-    b"molecul",
-    b"compound",
-    b"drug",
-    b"ligand",
-    b"pubchem",
-    b"zinc",
-    b"tox21",
-    b"qm9",
-];
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChemistryConfig {
+    hints: Vec<String>,
+}
 
-fn chemistry_hint(text: &str) -> bool {
-    CHEMISTRY_HINTS.iter().any(|hint| {
+fn parse_chemistry_hints(input: &str) -> Result<Vec<String>, String> {
+    let config: ChemistryConfig = toml::from_str(input).map_err(|err| err.to_string())?;
+    if config.hints.is_empty()
+        || config
+            .hints
+            .iter()
+            .any(|hint| hint.is_empty() || !hint.is_ascii() || hint.trim() != hint)
+    {
+        return Err("hints must be a nonempty TOML array of nonempty ASCII substrings without surrounding spaces".into());
+    }
+    Ok(config.hints)
+}
+
+fn load_chemistry_hints(path: &Path) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let input = std::fs::read_to_string(path)?;
+    Ok(parse_chemistry_hints(&input)?)
+}
+
+fn chemistry_hint(text: &str, hints: &[String]) -> bool {
+    hints.iter().any(|hint| {
         text.as_bytes()
             .windows(hint.len())
-            .any(|window| window.eq_ignore_ascii_case(hint))
+            .any(|window| window.eq_ignore_ascii_case(hint.as_bytes()))
     })
 }
 
@@ -473,6 +491,7 @@ fn fast_skip(
     dataset: &HubDataset,
     has_token: bool,
     no_chemistry_filter: bool,
+    hints: &[String],
 ) -> Option<&'static str> {
     if !has_token
         && dataset
@@ -491,9 +510,12 @@ fn fast_skip(
         return Some("metadata lists no CSV/TSV format; use --thorough to include Parquet/JSONL");
     }
     if !no_chemistry_filter
-        && !chemistry_hint(&dataset.id)
-        && !dataset.tags.iter().any(|tag| chemistry_hint(tag))
-        && !dataset.description.as_deref().is_some_and(chemistry_hint)
+        && !chemistry_hint(&dataset.id, hints)
+        && !dataset.tags.iter().any(|tag| chemistry_hint(tag, hints))
+        && !dataset
+            .description
+            .as_deref()
+            .is_some_and(|text| chemistry_hint(text, hints))
     {
         return Some("no chemistry hint in Hub metadata; use --no-chemistry-filter to include it");
     }
@@ -711,6 +733,7 @@ fn probe_page(
     thorough: bool,
     has_token: bool,
     no_chemistry_filter: bool,
+    hints: &[String],
     pool: &rayon::ThreadPool,
     reporter: &mut Reporter,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -718,7 +741,7 @@ fn probe_page(
     // A negative sample under a larger budget must not reuse a smaller probe.
     for dataset in datasets {
         if !thorough {
-            if let Some(reason) = fast_skip(dataset, has_token, no_chemistry_filter) {
+            if let Some(reason) = fast_skip(dataset, has_token, no_chemistry_filter, hints) {
                 reporter.emit(&skipped_result(dataset, reason))?;
                 continue;
             }
@@ -803,6 +826,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             args.force,
         );
     }
+    if let Some(output) = &args.export_timings {
+        return timings::export(&args.cache, output);
+    }
+    let hints = if args.thorough || args.no_chemistry_filter || !args.datasets.is_empty() {
+        Vec::new()
+    } else {
+        load_chemistry_hints(&args.chemistry_hints_file)?
+    };
     let mut builder = Client::builder().timeout(Duration::from_secs(15));
     let token = std::env::var("HF_TOKEN")
         .ok()
@@ -854,6 +885,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 args.thorough,
                 token.is_some(),
                 args.no_chemistry_filter,
+                &hints,
                 &pool,
                 &mut reporter,
             )?;
@@ -889,7 +921,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 args.max_files,
                 args.thorough,
                 token.is_some(),
-                args.no_chemistry_filter,
+                true,
+                &hints,
                 &pool,
                 &mut reporter,
             )?;
@@ -942,6 +975,7 @@ mod tests {
 
     #[test]
     fn fast_screen_skips_uninspected_metadata_without_calling_it_a_negative() {
+        let default = parse_chemistry_hints(include_str!("../chemistry-hints.toml")).unwrap();
         let mut dataset = HubDataset {
             id: "org/random-prompts".into(),
             sha: None,
@@ -950,30 +984,62 @@ mod tests {
             gated: Some(serde_json::Value::Bool(false)),
         };
         assert!(
-            fast_skip(&dataset, false, false)
+            fast_skip(&dataset, false, false, &default)
                 .unwrap()
                 .contains("chemistry hint")
         );
-        assert_eq!(fast_skip(&dataset, false, true), None);
-        let skipped = skipped_result(&dataset, fast_skip(&dataset, false, false).unwrap());
+        assert_eq!(fast_skip(&dataset, false, true, &default), None);
+        let skipped = skipped_result(
+            &dataset,
+            fast_skip(&dataset, false, false, &default).unwrap(),
+        );
         let json = serde_json::to_value(&skipped).unwrap();
         assert_eq!(json["status"], "skipped");
         assert_eq!(json["has_smiles"], false);
         assert_eq!(json["sampled_rows"], 0);
 
         dataset.description = Some("Molecular structures in this collection".into());
-        assert_eq!(fast_skip(&dataset, false, false), None);
+        assert_eq!(fast_skip(&dataset, false, false, &default), None);
         dataset.tags = vec!["format:parquet".into()];
         assert!(
-            fast_skip(&dataset, false, true)
+            fast_skip(&dataset, false, true, &default)
                 .unwrap()
                 .contains("no CSV/TSV")
         );
         dataset.tags = vec!["format:csv".into()];
         dataset.gated = Some(serde_json::Value::String("auto".into()));
-        assert!(fast_skip(&dataset, false, true).unwrap().contains("gated"));
-        assert_eq!(fast_skip(&dataset, true, true), None);
+        assert!(
+            fast_skip(&dataset, false, true, &default)
+                .unwrap()
+                .contains("gated")
+        );
+        assert_eq!(fast_skip(&dataset, true, true, &default), None);
     }
+    #[test]
+    fn custom_hints_replace_defaults_for_metadata_screening() {
+        let custom = parse_chemistry_hints("hints = [\"proteins\", \"ENZYME\"]").unwrap();
+        let mut dataset = HubDataset {
+            id: "org/drug-data".into(),
+            sha: None,
+            tags: vec!["format:csv".into()],
+            description: None,
+            gated: None,
+        };
+        let default = parse_chemistry_hints(include_str!("../chemistry-hints.toml")).unwrap();
+        assert_eq!(fast_skip(&dataset, false, false, &default), None);
+        assert!(fast_skip(&dataset, false, false, &custom).is_some());
+        dataset.description = Some("Enzyme activities".into());
+        assert_eq!(fast_skip(&dataset, false, false, &custom), None);
+        dataset.tags = vec!["format:parquet".into()];
+        assert!(
+            fast_skip(&dataset, false, false, &custom)
+                .unwrap()
+                .contains("CSV/TSV")
+        );
+        assert!(parse_chemistry_hints("hints = [\"chem\", \"\"]").is_err());
+        assert!(parse_chemistry_hints("hints = []").is_err());
+    }
+
     #[test]
     fn terminal_result_distinguishes_match_from_sampled_negative_and_failure() {
         let mut result = DatasetResult {
