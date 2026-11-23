@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Read-only inspection results for SMILES in Hugging Face datasets.">
+  <title>SMILES inspection dashboard</title>
+  <style>
+    :root { color-scheme: light; font-family: system-ui, sans-serif; line-height: 1.5; color: #172536; background: #f5f7fa; }
+    * { box-sizing: border-box; }
+    body { margin: 0; }
+    a { color: #164b87; text-decoration-thickness: .08em; text-underline-offset: .2em; }
+    a:hover { color: #0a3164; }
+    :focus-visible { outline: 3px solid #be6328; outline-offset: 3px; }
+    header { background: #17304b; color: #fff; padding: 2.4rem max(1rem, calc((100vw - 76rem) / 2)); }
+    header h1 { font-size: clamp(1.7rem, 4vw, 2.5rem); line-height: 1.15; margin: 0 0 .6rem; }
+    header p { max-width: 67ch; margin: 0; color: #e1eaf3; }
+    main { max-width: 78rem; margin: auto; padding: 1.5rem 1rem 3rem; }
+    h2 { font-size: 1.25rem; margin: 1.8rem 0 .7rem; }
+    .muted { color: #4c5e70; }
+    .notice { padding: .8rem 1rem; border-radius: .4rem; background: #e7f0f7; }
+    .error { background: #fff0eb; color: #792b16; border: 1px solid #c67d65; }
+    .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr)); gap: .75rem; margin: 1rem 0; }
+    .card { background: #fff; border: 1px solid #d5dfe7; border-radius: .5rem; padding: .85rem 1rem; }
+    .card dt { color: #45586b; font-size: .9rem; }
+    .card dd { font-size: 1.65rem; font-weight: 700; margin: .2rem 0 0; font-variant-numeric: tabular-nums; }
+    .controls { display: flex; flex-wrap: wrap; gap: .8rem; align-items: end; margin: 1rem 0; }
+    .controls label { display: grid; gap: .25rem; font-weight: 600; font-size: .9rem; }
+    .controls input, .controls select { font: inherit; min-height: 2.5rem; border: 1px solid #8295a8; border-radius: .3rem; background: #fff; color: inherit; padding: .35rem .55rem; }
+    .controls input { width: min(100%, 21rem); }
+    .table-wrap { overflow-x: auto; background: #fff; border: 1px solid #d5dfe7; border-radius: .5rem; }
+    table { border-collapse: collapse; width: 100%; min-width: 52rem; }
+    caption { text-align: left; padding: .8rem 1rem; color: #45586b; }
+    th, td { text-align: left; vertical-align: top; padding: .8rem .75rem; border-top: 1px solid #e2e8ed; }
+    thead th { background: #edf2f6; font-size: .87rem; border-top: 0; white-space: nowrap; }
+    tbody tr:hover { background: #f5f9fc; }
+    td:first-child { min-width: 15rem; max-width: 22rem; }
+    td:nth-child(3) { min-width: 12rem; }
+    .name { font-weight: 700; overflow-wrap: anywhere; }
+    .file { display: block; overflow-wrap: anywhere; }
+    .meta { display: block; font-size: .85rem; color: #4c5e70; }
+    td code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; background: #edf2f6; border-radius: .2rem; padding: .1rem .25rem; overflow-wrap: anywhere; }
+    .links { display: flex; flex-wrap: wrap; column-gap: .8rem; font-size: .85rem; margin-top: .35rem; }
+    .badge { display: inline-block; padding: .1rem .5rem; border-radius: 1rem; background: #e2f3eb; color: #115939; font-weight: 650; }
+    .badge.partial { background: #fff0d8; color: #7b4309; }
+    .chart { height: .65rem; background: #e7edf2; display: flex; border-radius: 1rem; overflow: hidden; margin: .35rem 0; }
+    .chart .valid { background: #19835b; }
+    .chart .invalid { background: #d08129; }
+    .volume { height: .35rem; background: #e7edf2; border-radius: 1rem; overflow: hidden; margin-top: .4rem; }
+    .volume span { display: block; height: 100%; background: #2868a1; }
+    .number { font-variant-numeric: tabular-nums; }
+    [hidden] { display: none !important; }
+    @media (max-width: 40rem) {
+      header { padding: 1.5rem 1rem; }
+      main { padding-top: .8rem; }
+      .controls label:first-child, .controls input { width: 100%; }
+      th, td { padding: .65rem .55rem; }
+    }
+  </style>
+  <script src="./app.js" defer></script>
+</head>
+<body>
+  <header>
+    <h1>SMILES inspection dashboard</h1>
+    <p>Revision-pinned, file-level inspections of Hugging Face datasets. Counts cover scanned files only, not every shard or row of a dataset. Unique strings refer to observed SMILES text, not canonicalized molecules.</p>
+  </header>
+  <main>
+    <p id="state" class="notice" role="status" aria-live="polite">Loading inspection export…</p>
+    <div id="dashboard" hidden>
+      <p id="snapshot" class="muted"></p>
+      <h2>Inspected scope</h2>
+      <dl class="cards">
+        <div class="card"><dt>Inspected datasets</dt><dd id="dataset-count" class="number"></dd></div>
+        <div class="card"><dt>Valid parsed cells</dt><dd id="valid-count" class="number"></dd></div>
+        <div class="card"><dt id="unique-label">Unique valid strings</dt><dd id="unique-count" class="number"></dd></div>
+        <div class="card"><dt>Complete / partial files</dt><dd id="status-count" class="number"></dd></div>
+      </dl>
+      <p class="muted">Validity uses exact valid ÷ (valid + invalid) parsed-cell counts. Empty, non-string, and oversized cells are excluded; partial scans contain oversized cells and are not complete results. The blue count bar compares valid cells to the largest inspected file; green/orange bars show each file's valid/invalid proportion. <span id="unique-method-note"></span></p>
+      <h2 id="results-heading">Inspected files</h2>
+      <div class="controls" role="group" aria-label="Filter and sort inspected files">
+        <label>Search datasets and files<input id="search" type="search" autocomplete="off" placeholder="Dataset, file, column…"></label>
+        <label>Status<select id="status-filter"><option value="all">All statuses</option><option value="complete">Complete</option><option value="partial">Partial</option></select></label>
+        <label>Sort by<select id="sort"><option value="dataset">Dataset name</option><option value="validity-desc">Validity, highest first</option><option value="validity-asc">Validity, lowest first</option><option value="valid-desc">Valid cells, most first</option><option value="rows-desc">Rows scanned, most first</option><option value="checked-desc">Last checked, newest first</option></select></label>
+      </div>
+      <div class="table-wrap" role="region" aria-labelledby="results-heading" tabindex="0">
+        <table>
+          <caption id="result-count" aria-live="polite"></caption>
+          <thead><tr><th scope="col">Dataset and pinned file</th><th scope="col">Inspection scope</th><th scope="col">Parsed validity</th><th scope="col">Other cells</th><th scope="col">Checked</th></tr></thead>
+          <tbody id="results"></tbody>
+        </table>
+      </div>
+      <p id="empty" class="notice" hidden></p>
+    </div>
+  </main>
+</body>
+</html>

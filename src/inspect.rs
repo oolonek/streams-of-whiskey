@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fs::{File, OpenOptions};
@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use crate::cache::Cache;
 use crate::direct_probe::RangeSource;
 use crate::full_scan::{Axis, ScanCounts, ScanObserver};
+use crate::hll::Sketch;
 use crate::rate::RateGate;
 use crate::{
     dataset_url, full_parquet, full_text, parse_response, send_with_gate, tabular_format,
@@ -210,6 +211,26 @@ impl ScanObserver for DatasetProgress {
         }
     }
 }
+struct InspectionObserver<'a> {
+    progress: &'a DatasetProgress,
+    sketch: &'a RefCell<Sketch>,
+}
+
+impl ScanObserver for InspectionObserver<'_> {
+    fn progress(&self, counts: &ScanCounts, total_rows: Option<u64>) {
+        self.progress.progress(counts, total_rows);
+    }
+
+    fn valid_smiles(&self, smiles: &str) -> Result<(), String> {
+        self.sketch.borrow_mut().insert(smiles);
+        Ok(())
+    }
+
+    fn reset_smiles(&self) -> Result<(), String> {
+        self.sketch.borrow_mut().clear();
+        Ok(())
+    }
+}
 
 #[derive(Deserialize)]
 struct FoundLocation {
@@ -237,17 +258,17 @@ struct RevisionInfo {
     sha: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct DetailRow<'a> {
     dataset: &'a str,
     version: String,
-    version_source: &'static str,
+    version_source: &'a str,
     dataset_url: String,
     file: &'a str,
     file_url: String,
-    format: &'static str,
-    scope: &'static str,
-    axis: &'static str,
+    format: &'a str,
+    scope: &'a str,
+    axis: &'a str,
     found_row: u64,
     found_column: &'a str,
     file_bytes: Option<u64>,
@@ -259,7 +280,7 @@ struct DetailRow<'a> {
     non_string_cells: Option<u64>,
     oversized_cells: Option<u64>,
     valid_of_parsed_percent: Option<String>,
-    status: &'static str,
+    status: &'a str,
     error: String,
     checked_at_unix: u64,
 }
@@ -395,10 +416,11 @@ fn scan_text_stream<R: Read>(
     wide: bool,
     size: Option<u64>,
     progress: &DatasetProgress,
+    observer: &dyn ScanObserver,
 ) -> Result<Option<ScanCounts>, String> {
     if axis != Axis::Auto || wide {
         progress.phase("downloading + parsing");
-        return full_text::scan_with_progress(reader, format, column, row, axis, progress)
+        return full_text::scan_with_progress(reader, format, column, row, axis, observer)
             .map(Some);
     }
     progress.phase("sniffing first 128 KiB");
@@ -417,7 +439,7 @@ fn scan_text_stream<R: Read>(
     }
     progress.phase("downloading + parsing");
     let replay = io::Cursor::new(prefix).chain(reader);
-    full_text::scan_with_progress(replay, format, column, row, axis, progress).map(Some)
+    full_text::scan_with_progress(replay, format, column, row, axis, observer).map(Some)
 }
 
 fn scan_file(
@@ -431,6 +453,7 @@ fn scan_file(
     axis: Axis,
     wide: bool,
     progress: &DatasetProgress,
+    observer: &dyn ScanObserver,
 ) -> Result<(Option<ScanCounts>, Option<u64>), String> {
     if format == "parquet" {
         progress.phase("checking file size");
@@ -444,7 +467,7 @@ fn scan_file(
             }
         }
         progress.phase("downloading Parquet metadata");
-        return full_parquet::scan_with_progress(&source, column, row, axis, progress)
+        return full_parquet::scan_with_progress(&source, column, row, axis, observer)
             .map(|counts| (Some(counts), Some(size)));
     }
     progress.phase("connecting to file");
@@ -467,9 +490,12 @@ fn scan_file(
             wide,
             size,
             progress,
+            observer,
         )
     } else {
-        scan_text_stream(response, format, column, row, axis, wide, size, progress)
+        scan_text_stream(
+            response, format, column, row, axis, wide, size, progress, observer,
+        )
     }?;
     Ok((counts, size))
 }
@@ -501,9 +527,19 @@ fn set_counts(detail: &mut DetailRow<'_>, counts: ScanCounts) {
 pub fn run(
     cache_path: &Path,
     input: Option<&Path>,
-    output: &Path,
+    output: Option<&Path>,
     axis: Axis,
+    force: bool,
 ) -> Result<(), Box<dyn Error>> {
+    let cache = Cache::open(cache_path)?;
+    if cache.migration_needed()? {
+        return Err(format!(
+            "legacy inspected_smiles data in {}; run --migrate-hll --cache {} before inspecting",
+            cache_path.display(),
+            cache_path.display()
+        )
+        .into());
+    }
     let hits = load_hits(cache_path, input)?;
     let token = std::env::var("HF_TOKEN")
         .ok()
@@ -511,17 +547,20 @@ pub fn run(
     let short_client = client(token.as_deref(), REQUEST_TIMEOUT)?;
     let stream_client = client(token.as_deref(), STREAM_TIMEOUT)?;
     let gate = Arc::new(RateGate::new());
-    // Never truncate an existing report: an interrupted run leaves completed rows intact.
-    let file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(output)?;
-    let mut writer = csv::WriterBuilder::new()
-        .delimiter(b'\t')
-        .has_headers(false)
-        .from_writer(file);
-    writer.write_record(OUTPUT_HEADERS)?;
-    writer.flush()?;
+    // Only an explicitly requested report is materialized. The SQLite cache
+    // persists each completed dataset independently of the optional TSV.
+    let mut writer = output
+        .map(|path| -> Result<_, Box<dyn Error>> {
+            let file = OpenOptions::new().write(true).create_new(true).open(path)?;
+            let mut writer = csv::WriterBuilder::new()
+                .delimiter(b'\t')
+                .has_headers(false)
+                .from_writer(file);
+            writer.write_record(OUTPUT_HEADERS)?;
+            writer.flush()?;
+            Ok(writer)
+        })
+        .transpose()?;
     let mut failures = 0_usize;
     let mut ambiguous = 0_usize;
     let mut progress = InspectionProgress::new(hits.len());
@@ -561,6 +600,8 @@ pub fn run(
             error: String::new(),
             checked_at_unix: 0,
         };
+        let mut replay = None;
+        let mut sketch = None;
         let analysis = (|| -> Result<(), String> {
             let revision = match &hit.revision {
                 Some(revision) => {
@@ -572,6 +613,23 @@ pub fn run(
                     current_revision(&short_client, &gate, &hit.hit.dataset)?
                 }
             };
+            if !force {
+                if let Some(cached) = cache
+                    .inspection(&hit.hit.dataset)
+                    .map_err(|error| format!("reading inspection cache: {error}"))?
+                {
+                    if cached.revision == revision
+                        && cached.file == location.file
+                        && cached.axis_request == axis.label()
+                        && cached.found_row == location.row
+                        && cached.found_column == location.column
+                    {
+                        current.phase("reusing completed inspection");
+                        replay = Some(cached.detail_json);
+                        return Ok(());
+                    }
+                }
+            }
             detail.version = revision.clone();
             detail.dataset_url = hub_url(&hit.hit.dataset, Some(&revision))?.to_string();
             let url = dataset_url(&hit.hit.dataset, &revision, Some(&location.file))?;
@@ -579,6 +637,11 @@ pub fn run(
             if detail.format == "unsupported" {
                 return Err(format!("unsupported file extension: {}", location.file));
             }
+            let collected = RefCell::new(Sketch::new());
+            let observer = InspectionObserver {
+                progress: &current,
+                sketch: &collected,
+            };
             let (counts, size) = scan_file(
                 &short_client,
                 &stream_client,
@@ -590,7 +653,9 @@ pub fn run(
                 axis,
                 location.wide,
                 &current,
+                &observer,
             )?;
+            sketch = Some(collected.into_inner());
             detail.file_bytes = size;
             if let Some(counts) = counts {
                 set_counts(&mut detail, counts);
@@ -605,15 +670,63 @@ pub fn run(
         if let Err(error) = analysis {
             detail.error = error;
         }
+        if let Some(json) = replay {
+            let stored: DetailRow<'_> = serde_json::from_str(&json)?;
+            if let Some(writer) = &mut writer {
+                writer.serialize(&stored)?;
+                writer.flush()?;
+            }
+            if output.is_none() && !stored.error.is_empty() {
+                eprintln!("{} · {}: {}", stored.dataset, stored.status, stored.error);
+            }
+            if stored.status == "partial" {
+                failures += 1;
+            }
+            progress.finish(
+                &current,
+                stored.status,
+                stored.valid_smiles.unwrap_or(0),
+                failures,
+                ambiguous,
+            )?;
+            continue;
+        }
         detail.checked_at_unix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        if matches!(detail.status, "complete" | "partial") {
+            let save = serde_json::to_string(&detail)
+                .map_err(|error| error.to_string())
+                .and_then(|json| {
+                    cache
+                        .replace_inspection(
+                            &hit.hit.dataset,
+                            &detail.version,
+                            &location.file,
+                            axis.label(),
+                            location.row,
+                            &location.column,
+                            &json,
+                            sketch.as_ref().expect("completed scan has a sketch"),
+                        )
+                        .map_err(|error| error.to_string())
+                });
+            if let Err(error) = save {
+                detail.status = "error";
+                detail.error = format!("persisting inspection: {error}");
+            }
+        }
         if detail.status == "ambiguous" {
             ambiguous += 1;
         }
         if matches!(detail.status, "partial" | "error") {
             failures += 1;
         }
-        writer.serialize(&detail)?;
-        writer.flush()?;
+        if let Some(writer) = &mut writer {
+            writer.serialize(&detail)?;
+            writer.flush()?;
+        }
+        if output.is_none() && !detail.error.is_empty() {
+            eprintln!("{} · {}: {}", detail.dataset, detail.status, detail.error);
+        }
         progress.finish(
             &current,
             detail.status,
@@ -628,18 +741,28 @@ pub fn run(
             progress.total_valid
         ));
     }
-    eprintln!(
-        "Wrote {} dataset reports to {} ({} ambiguous, {} incomplete)",
-        hits.len(),
-        output.display(),
-        ambiguous,
-        failures
-    );
+    if let Some(path) = output {
+        eprintln!(
+            "Wrote {} dataset reports to {} ({} ambiguous, {} incomplete)",
+            hits.len(),
+            path.display(),
+            ambiguous,
+            failures
+        );
+    } else {
+        eprintln!(
+            "Inspected {} datasets; results saved in {} ({} ambiguous, {} incomplete)",
+            hits.len(),
+            cache_path.display(),
+            ambiguous,
+            failures
+        );
+    }
     if failures != 0 {
-        return Err(format!(
-            "{failures} inspections incomplete; see {}",
-            output.display()
-        )
+        return Err(match output {
+            Some(path) => format!("{failures} inspections incomplete; see {}", path.display()),
+            None => format!("{failures} inspections incomplete; see errors above"),
+        }
         .into());
     }
     Ok(())
@@ -691,6 +814,7 @@ mod tests {
             false,
             Some(categories.len() as u64),
             &quiet_progress(),
+            &quiet_progress(),
         )
         .unwrap();
         assert!(counts.is_none());
@@ -705,6 +829,7 @@ mod tests {
             Axis::Auto,
             false,
             Some(molecules.len() as u64),
+            &quiet_progress(),
             &quiet_progress(),
         )
         .unwrap()
@@ -724,10 +849,152 @@ mod tests {
             false,
             Some(wide.len() as u64),
             &quiet_progress(),
+            &quiet_progress(),
         )
         .unwrap()
         .unwrap();
         assert_eq!((counts.axis, counts.valid), (Axis::Row, 1));
+    }
+
+    #[test]
+    fn scan_keeps_exact_valid_cell_counts_while_sketching_distinct_strings() {
+        let sketch = RefCell::new(Sketch::new());
+        let progress = quiet_progress();
+        let observer = InspectionObserver {
+            progress: &progress,
+            sketch: &sketch,
+        };
+        let rows = b"smiles\nCCO\nCCO\nN\nnot a smile!\n";
+        let counts = scan_text_stream(
+            rows.as_slice(),
+            "csv",
+            "smiles",
+            0,
+            Axis::Column,
+            false,
+            Some(rows.len() as u64),
+            &progress,
+            &observer,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            (counts.rows_scanned, counts.valid, counts.invalid),
+            (4, 3, 1)
+        );
+        assert_eq!(sketch.borrow().estimate(), 2);
+        observer.reset_smiles().unwrap();
+        assert_eq!(sketch.borrow().estimate(), 0);
+    }
+
+    #[test]
+    fn pinned_inspection_replays_the_identical_report_without_a_download() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!(
+            "streams-of-whiskey-inspection-{}-{suffix}",
+            std::process::id()
+        ));
+        let database = base.with_extension("sqlite");
+        let first = base.with_extension("first.tsv");
+        let second = base.with_extension("second.tsv");
+        let detail = DetailRow {
+            dataset: "org/data",
+            version: "sha-pinned".into(),
+            version_source: "cached_sha",
+            dataset_url: "https://huggingface.co/datasets/org/data/tree/sha-pinned".into(),
+            file: "train.csv",
+            file_url: "https://huggingface.co/datasets/org/data/resolve/sha-pinned/train.csv"
+                .into(),
+            format: "csv",
+            scope: "pinpointed_file",
+            axis: "column",
+            found_row: 0,
+            found_column: "smiles",
+            file_bytes: Some(42),
+            rows_scanned: Some(2),
+            cells_scanned: Some(2),
+            valid_smiles: Some(2),
+            invalid_smiles: Some(0),
+            empty_cells: Some(0),
+            non_string_cells: Some(0),
+            oversized_cells: Some(0),
+            valid_of_parsed_percent: Some("100.00".into()),
+            status: "complete",
+            error: String::new(),
+            checked_at_unix: 42,
+        };
+        {
+            let cache = Cache::open(&database).unwrap();
+            cache
+                .put(
+                    "org/data|direct:v3|rows=1",
+                    Some("sha-pinned"),
+                    r#"{"dataset":"org/data","status":"found","location":{"file":"train.csv","row":0,"column":"smiles"}}"#,
+                )
+                .unwrap();
+            let mut sketch = Sketch::new();
+            sketch.insert("CCO");
+            cache
+                .replace_inspection(
+                    "org/data",
+                    "sha-pinned",
+                    "train.csv",
+                    "column",
+                    0,
+                    "smiles",
+                    &serde_json::to_string(&detail).unwrap(),
+                    &sketch,
+                )
+                .unwrap();
+        }
+        run(&database, None, Some(&first), Axis::Column, false).unwrap();
+        run(&database, None, Some(&second), Axis::Column, false).unwrap();
+        let report = std::fs::read_to_string(&first).unwrap();
+        assert_eq!(report, std::fs::read_to_string(&second).unwrap());
+        let mut expected = csv::WriterBuilder::new()
+            .delimiter(b'\t')
+            .has_headers(false)
+            .from_writer(Vec::new());
+        expected.write_record(OUTPUT_HEADERS).unwrap();
+        expected.serialize(&detail).unwrap();
+        assert_eq!(report.as_bytes(), expected.into_inner().unwrap());
+        std::fs::remove_file(first).unwrap();
+        std::fs::remove_file(second).unwrap();
+        std::fs::remove_file(database).unwrap();
+    }
+
+    #[test]
+    fn legacy_cache_is_rejected_before_writing_a_report_or_contacting_hub() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let database = std::env::temp_dir().join(format!(
+            "streams-of-whiskey-legacy-inspect-{}-{suffix}.sqlite",
+            std::process::id()
+        ));
+        let report = database.with_extension("tsv");
+        {
+            Cache::open(&database).unwrap();
+            rusqlite::Connection::open(&database)
+                .unwrap()
+                .execute_batch(
+                    "CREATE TABLE inspected_smiles (
+                    dataset_id TEXT NOT NULL, smiles TEXT NOT NULL,
+                    PRIMARY KEY(dataset_id, smiles)
+                )",
+                )
+                .unwrap();
+        }
+        let error = run(&database, None, Some(&report), Axis::Auto, false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--migrate-hll"));
+        assert!(!report.exists());
+        std::fs::remove_file(database).unwrap();
     }
 
     #[test]

@@ -1,4 +1,5 @@
 mod cache;
+mod dashboard;
 mod direct_probe;
 mod full_parquet;
 mod full_scan;
@@ -6,10 +7,12 @@ mod full_text;
 mod inspect;
 mod parquet_probe;
 mod rate;
+mod smiles_evidence;
 mod text_probe;
+use streams_of_whiskey::hll;
 
 use std::io::{self, IsTerminal, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
@@ -63,18 +66,30 @@ struct Args {
     /// Path to the SQLite probe cache
     #[arg(long, default_value = ".streams-of-whiskey.sqlite3")]
     cache: PathBuf,
-    /// Scan previously found files completely and write a detailed TSV
+    /// Inspect cached SMILES-containing datasets, retaining results in SQLite
     #[arg(long, conflicts_with_all = ["datasets", "max_datasets", "search", "json", "thorough", "no_chemistry_filter"])]
     inspect_found: bool,
     /// Crawl JSONL input; omit to inspect file-level matches in the SQLite cache
     #[arg(long = "input", requires = "inspect_found")]
     inspect_input: Option<PathBuf>,
-    /// Inspection TSV destination (default: found-details.tsv; must not already exist)
+    /// Optionally write a new TSV report (must not already exist)
     #[arg(long = "output", requires = "inspect_found")]
     inspect_output: Option<PathBuf>,
     /// Force a whole column or one wide row instead of automatic orientation
     #[arg(long = "axis", requires = "inspect_found", value_enum)]
     inspect_axis: Option<full_scan::Axis>,
+    /// Recompute inspected datasets even if a matching result is stored
+    #[arg(long, requires = "inspect_found")]
+    force: bool,
+    /// Export the stored inspections as a static dashboard JSON snapshot
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["datasets", "inspect_found", "max_datasets", "search", "json", "thorough", "no_chemistry_filter", "refresh"])]
+    export_dashboard: Option<PathBuf>,
+    /// Convert legacy exact SMILES records to sketches, then compact SQLite (stop active inspections first)
+    #[arg(long, conflicts_with_all = ["datasets", "inspect_found", "export_dashboard", "compact_cache", "max_datasets", "search", "json", "thorough", "no_chemistry_filter", "refresh"])]
+    migrate_hll: bool,
+    /// Reclaim SQLite space after a completed migration (stop active inspections first)
+    #[arg(long, conflicts_with_all = ["datasets", "inspect_found", "export_dashboard", "migrate_hll", "max_datasets", "search", "json", "thorough", "no_chemistry_filter", "refresh"])]
+    compact_cache: bool,
     /// Ignore cached results and probe again
     #[arg(long)]
     refresh: bool,
@@ -760,14 +775,32 @@ fn probe_page(
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+    if args.migrate_hll {
+        eprintln!(
+            "Converting legacy exact strings to HLL sketches in {}…",
+            args.cache.display()
+        );
+        let migrated = cache::migrate_hll(&args.cache)?;
+        eprintln!("Converted {migrated} inspections; compacting SQLite to reclaim space…");
+        cache::compact(&args.cache)?;
+        eprintln!("Migration and compaction complete");
+        return Ok(());
+    }
+    if args.compact_cache {
+        cache::compact(&args.cache)?;
+        eprintln!("SQLite compaction complete");
+        return Ok(());
+    }
+    if let Some(output) = &args.export_dashboard {
+        return dashboard::export(&args.cache, output);
+    }
     if args.inspect_found {
         return inspect::run(
             &args.cache,
             args.inspect_input.as_deref(),
-            args.inspect_output
-                .as_deref()
-                .unwrap_or_else(|| Path::new("found-details.tsv")),
+            args.inspect_output.as_deref(),
             args.inspect_axis.unwrap_or(full_scan::Axis::Auto),
+            args.force,
         );
     }
     let mut builder = Client::builder().timeout(Duration::from_secs(15));

@@ -1,13 +1,11 @@
 use crate::direct_probe::{FileSample, RangeSource};
-use crate::full_scan::{SmilesSniffer, is_wide_label};
+use crate::smiles_evidence::{SmilesEvidence, WideRow};
 use rand::seq::index;
-use smiles_rs::prelude::Smiles;
 use std::collections::HashMap;
 
 const PREFIX_BYTES: usize = 128 * 1024;
 const MAX_RECORD_BYTES: usize = 64 * 1024;
 const MAX_RECORDS: usize = 4096;
-const MAX_SMILES_BYTES: usize = 4096;
 
 /// Samples complete rows in the first 128 KiB only; after the first 32 rows,
 /// random rows are selected from that prefix, not from the entire file.
@@ -70,18 +68,18 @@ pub fn sniff_prefix_column(
             let Some(selected) = selected else {
                 return Ok(false);
             };
-            let mut sniffer = SmilesSniffer::new(column);
+            let mut evidence = SmilesEvidence::new(column);
             for (index, row) in rows.iter().enumerate() {
                 let Some(text) = row.get(selected) else {
                     continue;
                 };
                 if index as u64 == found_row
-                    && is_wide_label(row.get(0).unwrap_or_default(), selected)
-                    && valid_smiles(text)
+                    && WideRow::from_label(row.get(0).unwrap_or_default(), selected != 0)
+                        .is_some_and(|wide| wide.accepts(text))
                 {
                     return Ok(true);
                 }
-                if sniffer.observe(index as u64, text).is_some() {
+                if evidence.observe(index as u64, text).is_some() {
                     return Ok(true);
                 }
             }
@@ -89,29 +87,28 @@ pub fn sniff_prefix_column(
         }
         "jsonl" | "ndjson" => {
             let rows = jsonl_rows(bytes, at_eof)?;
-            let mut sniffer = SmilesSniffer::new(column);
+            let mut evidence = SmilesEvidence::new(column);
             for (index, row) in rows.iter().enumerate() {
                 let Some(object) = row.as_object() else {
                     continue;
                 };
-                let labeled = ["property", "label"].iter().any(|name| {
+                let wide = ["property", "label"].iter().find_map(|name| {
                     object
                         .get(*name)
                         .and_then(|value| value.as_str())
-                        .is_some_and(|label| is_wide_label(label, 1))
+                        .and_then(|label| WideRow::from_label(label, true))
                 });
                 let Some(text) = object.get(column).and_then(|value| value.as_str()) else {
                     continue;
                 };
                 if index as u64 == found_row
-                    && labeled
                     && column != "property"
                     && column != "label"
-                    && valid_smiles(text)
+                    && wide.is_some_and(|row| row.accepts(text))
                 {
                     return Ok(true);
                 }
-                if sniffer.observe(index as u64, text).is_some() {
+                if evidence.observe(index as u64, text).is_some() {
                     return Ok(true);
                 }
             }
@@ -119,10 +116,6 @@ pub fn sniff_prefix_column(
         }
         _ => Err(format!("unsupported text dataset extension: {format}")),
     }
-}
-
-fn valid_smiles(text: &str) -> bool {
-    !text.is_empty() && text.len() <= MAX_SMILES_BYTES && Smiles::from_str(text).is_ok()
 }
 
 fn sample_rows<F>(row_count: usize, samples: u32, mut column: F) -> Result<FileSample, String>
@@ -225,13 +218,13 @@ fn sample_csv(
     at_eof: bool,
 ) -> Result<FileSample, String> {
     let (headers, rows) = csv_rows(bytes, delimiter, at_eof)?;
-    let mut sniffers: Vec<SmilesSniffer> = Vec::new();
+    let mut evidence: Vec<SmilesEvidence> = Vec::new();
     sample_rows(rows.len(), samples, |index| {
         let row = &rows[index];
-        let labeled = is_wide_label(row.get(0).unwrap_or_default(), 1);
+        let wide = WideRow::from_label(row.get(0).unwrap_or_default(), true);
         for (col, text) in row.iter().enumerate() {
-            if col >= sniffers.len() {
-                sniffers.push(SmilesSniffer::new(headers.get(col).unwrap_or_default()));
+            if col >= evidence.len() {
+                evidence.push(SmilesEvidence::new(headers.get(col).unwrap_or_default()));
             }
             let name = || {
                 headers
@@ -239,11 +232,11 @@ fn sample_csv(
                     .filter(|header| !header.is_empty())
                     .map_or_else(|| col.to_string(), str::to_owned)
             };
-            if labeled && col > 0 && valid_smiles(text) {
+            if col > 0 && wide.is_some_and(|row| row.accepts(text)) {
                 return Ok(Some((index as u64, name(), true)));
             }
-            if let Some(found_row) = sniffers[col].observe(index as u64, text) {
-                return Ok(Some((found_row, name(), labeled && col > 0)));
+            if let Some(found_row) = evidence[col].observe(index as u64, text) {
+                return Ok(Some((found_row, name(), wide.is_some() && col > 0)));
             }
         }
         Ok(None)
@@ -280,30 +273,30 @@ fn jsonl_rows(bytes: &[u8], at_eof: bool) -> Result<Vec<serde_json::Value>, Stri
 
 fn sample_jsonl(bytes: &[u8], samples: u32, at_eof: bool) -> Result<FileSample, String> {
     let rows = jsonl_rows(bytes, at_eof)?;
-    let mut sniffers: HashMap<&str, SmilesSniffer> = HashMap::new();
+    let mut evidence: HashMap<&str, SmilesEvidence> = HashMap::new();
     sample_rows(rows.len(), samples, |index| {
         let Some(object) = rows[index].as_object() else {
             return Ok(None);
         };
-        let labeled = ["property", "label"].iter().any(|name| {
+        let wide = ["property", "label"].iter().find_map(|name| {
             object
                 .get(*name)
                 .and_then(|value| value.as_str())
-                .is_some_and(|label| is_wide_label(label, 1))
+                .and_then(|label| WideRow::from_label(label, true))
         });
         for (name, value) in object {
             let Some(text) = value.as_str() else {
                 continue;
             };
-            if labeled && name != "property" && name != "label" && valid_smiles(text) {
+            if name != "property" && name != "label" && wide.is_some_and(|row| row.accepts(text)) {
                 return Ok(Some((index as u64, name.clone(), true)));
             }
-            if let Some(found_row) = sniffers
+            if let Some(found_row) = evidence
                 .entry(name.as_str())
-                .or_insert_with(|| SmilesSniffer::new(name))
+                .or_insert_with(|| SmilesEvidence::new(name))
                 .observe(index as u64, text)
             {
-                return Ok(Some((found_row, name.clone(), labeled)));
+                return Ok(Some((found_row, name.clone(), wide.is_some())));
             }
         }
         Ok(None)
@@ -500,6 +493,10 @@ mod tests {
         let wide = b"{\"property\":\"other\",\"sample_a\":\"F\"}\n{\"property\":\"SMILES\",\"sample_a\":\"C\"}\n";
         assert!(sniff_prefix_column(wide, "jsonl", "sample_a", 1, true).unwrap());
         assert!(!sniff_prefix_column(wide, "jsonl", "sample_a", 0, true).unwrap());
+        let labels = b"{\"property\":\"SMILES\",\"label\":\"SMILES\",\"sample_a\":\"F\"}\n";
+        assert!(!sniff_prefix_column(labels, "jsonl", "property", 0, true).unwrap());
+        assert!(!sniff_prefix_column(labels, "jsonl", "label", 0, true).unwrap());
+        assert!(sniff_prefix_column(labels, "jsonl", "sample_a", 0, true).unwrap());
         let incomplete = b"{\"sex\":\"F\"}\n{\"sex\":\"N#N\"}";
         assert!(!sniff_prefix_column(incomplete, "jsonl", "sex", 1, false).unwrap());
         assert!(sniff_prefix_column(incomplete, "jsonl", "sex", 1, true).unwrap());

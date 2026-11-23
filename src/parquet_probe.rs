@@ -16,17 +16,15 @@ use parquet::arrow::arrow_reader::{
 use parquet::errors::{ParquetError, Result as ParquetResult};
 use parquet::file::reader::{ChunkReader, Length};
 use rand::Rng;
-use smiles_rs::prelude::Smiles;
 
 use crate::direct_probe::{FileSample, RangeSource};
-use crate::full_scan::{SmilesSniffer, is_structure_column, is_wide_label};
+use crate::smiles_evidence::{SmilesEvidence, WideRow, preferred_column};
 
 const MAX_METADATA: usize = 8 * 1024 * 1024;
 const MAX_SELECTED_COLUMN_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_SAMPLES: usize = 512;
 const READ_CHUNK: usize = 64 * 1024;
 const MAX_RANGE: usize = 2 * 1024 * 1024;
-const MAX_SMILES_BYTES: usize = 4096;
 
 #[derive(Clone)]
 struct RangedParquet(RangeSource);
@@ -175,13 +173,10 @@ pub(crate) fn string_cell(array: &dyn Array, row: usize) -> Option<&str> {
     }
 }
 
-fn valid_smiles(text: &str) -> bool {
-    !text.is_empty() && text.len() <= MAX_SMILES_BYTES && Smiles::from_str(text).is_ok()
-}
-
 fn find_wide_smiles(batch: &RecordBatch) -> Option<String> {
     let text = string_cell(batch.column(0).as_ref(), 0)?;
-    valid_smiles(text).then(|| batch.schema().field(0).name().to_owned())
+    // The row was selected only after its first field supplied a wide-row label.
+    WideRow::parseable(text).then(|| batch.schema().field(0).name().to_owned())
 }
 
 fn check_footer(source: &RangeSource) -> Result<(), String> {
@@ -398,7 +393,8 @@ pub fn probe(source: &RangeSource, samples: u32) -> Result<FileSample, String> {
                 let batch = next_sample(&mut reader)?;
                 observed.insert(position);
                 if string_cell(batch.column(0).as_ref(), 0)
-                    .is_some_and(|label| is_wide_label(label, string_columns[1]))
+                    .and_then(|label| WideRow::from_label(label, string_columns[1] > 0))
+                    .is_some()
                 {
                     wide_positions.push(position);
                 }
@@ -432,10 +428,10 @@ pub fn probe(source: &RangeSource, samples: u32) -> Result<FileSample, String> {
         }
     }
 
-    // Names affect only ordering and confidence in SmilesSniffer. Every
+    // Names affect only ordering and confidence in SmilesEvidence. Every
     // top-level string column gets its own bounded projection and evidence
     // history; no structural name is required to qualify.
-    string_columns.sort_by_key(|&index| !is_structure_column(builder.schema().field(index).name()));
+    string_columns.sort_by_key(|&index| !preferred_column(builder.schema().field(index).name()));
     for index in string_columns {
         let Some(mut reader) = maybe_column_reader(
             source,
@@ -449,12 +445,12 @@ pub fn probe(source: &RangeSource, samples: u32) -> Result<FileSample, String> {
             continue;
         };
         let column = builder.schema().field(index).name();
-        let mut sniffer = SmilesSniffer::new(column);
+        let mut evidence = SmilesEvidence::new(column);
         for &position in &positions {
             let batch = next_sample(&mut reader)?;
             observed.insert(position);
             if let Some(row) = string_cell(batch.column(0).as_ref(), 0)
-                .and_then(|text| sniffer.observe(position, text))
+                .and_then(|text| evidence.observe(position, text))
             {
                 return Ok(FileSample {
                     found: Some((row, column.to_owned())),
@@ -496,20 +492,23 @@ pub fn sniff_column(source: &RangeSource, column: &str, found_row: u64) -> Resul
     let mut reader = column_reader(source, &metadata, &groups, &[found_row], index)?;
     let pinned = next_sample(&mut reader)?;
     let text = string_cell(pinned.column(0).as_ref(), 0);
-    let mut sniffer = SmilesSniffer::new(column);
+    let mut evidence = SmilesEvidence::new(column);
     if text
-        .and_then(|text| sniffer.observe(found_row, text))
+        .and_then(|text| evidence.observe(found_row, text))
         .is_some()
     {
         return Ok(true);
     }
     let string_columns = selected_string_columns(builder.schema());
-    if text.is_some_and(valid_smiles) && string_columns.first().is_some_and(|&first| first != index)
+    if text.is_some_and(WideRow::parseable)
+        && string_columns.first().is_some_and(|&first| first != index)
     {
         let mut label_reader =
             column_reader(source, &metadata, &groups, &[found_row], string_columns[0])?;
         let label = next_sample(&mut label_reader)?;
-        if string_cell(label.column(0).as_ref(), 0).is_some_and(|value| is_wide_label(value, index))
+        if string_cell(label.column(0).as_ref(), 0)
+            .and_then(|value| WideRow::from_label(value, index > 0))
+            .is_some()
         {
             return Ok(true);
         }
@@ -535,7 +534,7 @@ pub fn sniff_column(source: &RangeSource, column: &str, found_row: u64) -> Resul
     for position in positions {
         let batch = next_sample(&mut reader)?;
         if string_cell(batch.column(0).as_ref(), 0)
-            .and_then(|text| sniffer.observe(position, text))
+            .and_then(|text| evidence.observe(position, text))
             .is_some()
         {
             return Ok(true);
@@ -642,7 +641,7 @@ mod tests {
 
     #[test]
     fn rejects_invalid_and_oversized_cells_without_skipping_other_columns() {
-        let giant = "C".repeat(MAX_SMILES_BYTES + 1);
+        let giant = "C".repeat(4097);
         let data = fixture(
             vec![
                 (

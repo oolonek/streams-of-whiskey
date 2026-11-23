@@ -8,8 +8,9 @@ use parquet::errors::{ParquetError, Result as ParquetResult};
 use parquet::file::reader::{ChunkReader, Length};
 
 use crate::direct_probe::RangeSource;
-use crate::full_scan::{Axis, ScanCounts, ScanObserver, is_wide_label};
+use crate::full_scan::{Axis, ScanCounts, ScanObserver};
 use crate::parquet_probe::{is_string_type, string_cell};
+use crate::smiles_evidence::WideRow;
 
 const MAX_METADATA: usize = 8 * 1024 * 1024;
 const MAX_CHUNK: usize = 16 * 1024 * 1024;
@@ -241,7 +242,8 @@ pub fn scan_with_progress(
         .iter()
         .position(|field| is_string_type(field.data_type()));
     let mut wide = false;
-    if axis != Axis::Column && !(axis == Axis::Auto && is_wide_label(column, 1)) {
+    if axis != Axis::Column && !(axis == Axis::Auto && WideRow::from_label(column, true).is_some())
+    {
         if let Some(first) = first_string {
             if first != target {
                 check_chunks(
@@ -274,7 +276,8 @@ pub fn scan_with_progress(
                     return Err("Parquet label reader returned an unexpected row count".into());
                 }
                 wide = string_cell(batch.column(0).as_ref(), 0)
-                    .is_some_and(|label| is_wide_label(label, target));
+                    .and_then(|label| WideRow::from_label(label, target > 0))
+                    .is_some();
             }
         }
     }
@@ -338,7 +341,7 @@ pub fn scan_with_progress(
                             fields[index].name()
                         ));
                     }
-                    counts.check(cell);
+                    counts.check_with_observer(cell, observer)?;
                 } else {
                     counts.non_string();
                 }
@@ -452,6 +455,41 @@ mod tests {
                 (Axis::Column, 5, 5, 2, 1, Some(5)),
             ]
         );
+    }
+
+    #[test]
+    fn parquet_streams_decoded_strings_without_normalizing_or_duplicate_filtering() {
+        #[derive(Default)]
+        struct Collected(std::cell::RefCell<Vec<String>>);
+        impl ScanObserver for Collected {
+            fn progress(&self, _: &ScanCounts, _: Option<u64>) {}
+            fn valid_smiles(&self, smiles: &str) -> Result<(), String> {
+                self.0.borrow_mut().push(smiles.to_owned());
+                Ok(())
+            }
+        }
+        let data = fixture(
+            vec![(
+                "smiles",
+                Arc::new(StringArray::from(vec![
+                    "CCO",
+                    "C(C)O",
+                    "CCO",
+                    "bad smiles!",
+                ])),
+            )],
+            2,
+        );
+        let observer = Collected::default();
+        scan_with_progress(
+            &RangeSource::from_bytes(&data),
+            "smiles",
+            0,
+            Axis::Column,
+            &observer,
+        )
+        .unwrap();
+        assert_eq!(*observer.0.borrow(), ["CCO", "C(C)O", "CCO"]);
     }
 
     #[test]

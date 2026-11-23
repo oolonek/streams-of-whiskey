@@ -1,6 +1,7 @@
 use std::io::{BufRead, BufReader, Read};
 
-use crate::full_scan::{Axis, ScanCounts, ScanObserver, is_wide_label};
+use crate::full_scan::{Axis, ScanCounts, ScanObserver};
+use crate::smiles_evidence::WideRow;
 
 // Bound one JSON record, not the whole dataset. This still permits strings larger
 // than MAX_CELL_BYTES to be classified as oversized rather than misclassified.
@@ -93,27 +94,30 @@ fn scan_delimited<R: Read>(
         let index = counts.rows_scanned;
         if index == found_row {
             found = true;
-            let label = record.get(0).is_some_and(|first| is_wide_label(first, 1));
-            let labeled = label && selected != 0;
+            let wide = record
+                .get(0)
+                .and_then(|first| WideRow::from_label(first, true));
+            let labeled = wide.is_some() && selected != 0;
             if axis == Axis::Row || (axis == Axis::Auto && labeled) {
+                observer.reset_smiles()?;
                 let mut row_counts = ScanCounts::new(Axis::Row);
                 row_counts.rows_scanned = index + 1;
                 for (field, value) in record.iter().enumerate() {
-                    if field != 0 || !label {
-                        row_counts.check(Some(value));
+                    if field != 0 || wide.is_none() {
+                        row_counts.check_with_observer(Some(value), observer)?;
                     }
                 }
                 // Missing fields in a ragged row still represent empty cells.
                 for field in record.len()..headers.len() {
-                    if field != 0 || !label {
-                        row_counts.check(None);
+                    if field != 0 || wide.is_none() {
+                        row_counts.check_with_observer(None, observer)?;
                     }
                 }
                 observer.progress(&row_counts, None);
                 return Ok(row_counts);
             }
         }
-        counts.check(record.get(selected));
+        counts.check_with_observer(record.get(selected), observer)?;
         counts.rows_scanned += 1;
         report_row(&counts, observer);
     }
@@ -127,11 +131,18 @@ fn scan_delimited<R: Read>(
     Ok(counts)
 }
 
-fn check_json(counts: &mut ScanCounts, value: Option<&serde_json::Value>) {
+fn check_json(
+    counts: &mut ScanCounts,
+    value: Option<&serde_json::Value>,
+    observer: &dyn ScanObserver,
+) -> Result<(), String> {
     match value {
-        None => counts.check(None),
-        Some(serde_json::Value::String(text)) => counts.check(Some(text)),
-        Some(_) => counts.non_string(),
+        None => counts.check_with_observer(None, observer),
+        Some(serde_json::Value::String(text)) => counts.check_with_observer(Some(text), observer),
+        Some(_) => {
+            counts.non_string();
+            Ok(())
+        }
     }
 }
 
@@ -175,26 +186,27 @@ fn scan_jsonl<R: Read>(
             if !object.contains_key(column) {
                 return Err(format!("JSONL row {row}: column {column:?} not found"));
             }
-            let label = ["property", "label"].into_iter().find(|&field| {
+            let wide = ["property", "label"].into_iter().find_map(|field| {
                 object
                     .get(field)
                     .and_then(serde_json::Value::as_str)
-                    .is_some_and(|name| is_wide_label(name, 1))
+                    .and_then(|name| WideRow::from_label(name, true).map(|_| field))
             });
-            let labeled = label.is_some_and(|field| field != column);
+            let labeled = wide.is_some_and(|field| field != column);
             if axis == Axis::Row || (axis == Axis::Auto && labeled) {
+                observer.reset_smiles()?;
                 let mut row_counts = ScanCounts::new(Axis::Row);
                 row_counts.rows_scanned = row + 1;
                 for (field, value) in object {
-                    if Some(field.as_str()) != label {
-                        check_json(&mut row_counts, Some(value));
+                    if Some(field.as_str()) != wide {
+                        check_json(&mut row_counts, Some(value), observer)?;
                     }
                 }
                 observer.progress(&row_counts, None);
                 return Ok(row_counts);
             }
         }
-        check_json(&mut counts, object.get(column));
+        check_json(&mut counts, object.get(column), observer)?;
         counts.rows_scanned += 1;
         report_row(&counts, observer);
     }
@@ -226,6 +238,73 @@ mod tests {
                 total_rows,
             ));
         }
+    }
+
+    #[test]
+    fn every_text_format_streams_only_exact_valid_strings() {
+        #[derive(Default)]
+        struct Collected(RefCell<Vec<String>>);
+        impl ScanObserver for Collected {
+            fn progress(&self, _: &ScanCounts, _: Option<u64>) {}
+            fn valid_smiles(&self, smiles: &str) -> Result<(), String> {
+                self.0.borrow_mut().push(smiles.to_owned());
+                Ok(())
+            }
+        }
+
+        for (format, input) in [
+            ("csv", "smiles\nCCO\nC(C)O\nCCO\nnot a smiles!\n"),
+            ("tsv", "smiles\nCCO\nC(C)O\nCCO\nnot a smiles!\n"),
+            (
+                "jsonl",
+                "{\"smiles\":\"CCO\"}\n{\"smiles\":\"C(C)O\"}\n{\"smiles\":\"CCO\"}\n{\"smiles\":4}\n{\"smiles\":\"not a smiles!\"}\n",
+            ),
+            (
+                "ndjson",
+                "{\"smiles\":\"CCO\"}\n{\"smiles\":\"C(C)O\"}\n{\"smiles\":\"CCO\"}\n{\"smiles\":null}\n{\"smiles\":\"not a smiles!\"}\n",
+            ),
+        ] {
+            let collected = Collected::default();
+            scan_with_progress(
+                input.as_bytes(),
+                format,
+                "smiles",
+                0,
+                Axis::Column,
+                &collected,
+            )
+            .unwrap();
+            assert_eq!(*collected.0.borrow(), ["CCO", "C(C)O", "CCO"], "{format}");
+        }
+    }
+
+    #[test]
+    fn wide_row_discards_column_candidates_before_the_pinpoint() {
+        #[derive(Default)]
+        struct Collected(RefCell<Vec<String>>);
+        impl ScanObserver for Collected {
+            fn progress(&self, _: &ScanCounts, _: Option<u64>) {}
+            fn valid_smiles(&self, smiles: &str) -> Result<(), String> {
+                self.0.borrow_mut().push(smiles.to_owned());
+                Ok(())
+            }
+            fn reset_smiles(&self) -> Result<(), String> {
+                self.0.borrow_mut().clear();
+                Ok(())
+            }
+        }
+        let collected = Collected::default();
+        let counts = scan_with_progress(
+            &b"property,a,b\nother,CCO,N\nSMILES,C(C)O,O\n"[..],
+            "csv",
+            "a",
+            1,
+            Axis::Auto,
+            &collected,
+        )
+        .unwrap();
+        assert_eq!(counts.axis, Axis::Row);
+        assert_eq!(*collected.0.borrow(), ["C(C)O", "O"]);
     }
 
     #[test]
